@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, List
+from typing import Callable, Iterable, List, Optional
 import itertools
 
 import numpy as np
@@ -30,24 +30,51 @@ class MediaImporter:
         self.decoder = decoder
         self._id_counter = itertools.count(1)
 
-    def import_paths(self, paths: Iterable[Path]) -> ImportResult:
+    def import_paths(
+        self,
+        paths: Iterable[Path],
+        progress_callback: Optional[Callable[[Optional[float], str], None]] = None,
+        cancel_flag: Optional[Callable[[], bool]] = None,
+    ) -> ImportResult:
         assets: List[Asset] = []
         thumbnails: List[np.ndarray] = []
 
-        for path in paths:
+        path_list = list(paths)
+        total = len(path_list) or 1
+        existing_ids = {asset.id for asset in self.project.assets}
+
+        for index, path in enumerate(path_list):
+            if cancel_flag and cancel_flag():
+                break
+
+            if progress_callback:
+                progress_callback(
+                    (index / total),
+                    f"Importing {path.name}",
+                )
+
             asset_type = self._asset_type(path)
             if asset_type is None:
                 continue
-            asset_id = self._generate_id(asset_type)
+            asset_id = self._generate_id(asset_type, existing_ids)
+            existing_ids.add(asset_id)
             asset = Asset(id=asset_id, path=str(path), type=asset_type, metadata={})
-            self.project.add_asset(asset)
             assets.append(asset)
 
-            thumbnail = self._create_thumbnail(asset)
+            try:
+                thumbnail = self._create_thumbnail(asset)
+            except Exception as exc:  # pylint: disable=broad-except
+                raise RuntimeError(f"Failed to decode thumbnail for {path}: {exc}") from exc
             thumbnails.append(thumbnail)
 
             if asset_type == "audio":
-                self._generate_waveform(asset)
+                try:
+                    self._generate_waveform(asset)
+                except Exception as exc:  # pylint: disable=broad-except
+                    raise RuntimeError(f"Failed to create waveform for {path}: {exc}") from exc
+
+        if progress_callback:
+            progress_callback(1.0, "Import complete")
 
         return ImportResult(assets=assets, thumbnails=thumbnails)
 
@@ -59,17 +86,18 @@ class MediaImporter:
             return "audio"
         return None
 
-    def _generate_id(self, asset_type: str) -> str:
+    def _generate_id(self, asset_type: str, existing_ids: set[str]) -> str:
         prefix = "v" if asset_type == "video" else "a"
-        return f"{prefix}{next(self._id_counter)}"
+        while True:
+            candidate = f"{prefix}{next(self._id_counter)}"
+            if candidate not in existing_ids:
+                return candidate
 
     def _create_thumbnail(self, asset: Asset) -> np.ndarray:
-        try:
-            frame = self.decoder.video_frame_at(asset.id, Path(asset.path), 0.0)
-            image = frame.image
-        except Exception:
-            image = np.zeros((180, 320, 3), dtype=np.uint8)
-        return image
+        if asset.type == "audio":
+            return np.zeros((180, 320, 3), dtype=np.uint8)
+        frame = self.decoder.video_frame_at(asset.id, Path(asset.path), 0.0)
+        return frame.image
 
     def _generate_waveform(self, asset: Asset) -> None:
         try:
