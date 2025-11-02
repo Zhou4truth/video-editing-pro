@@ -25,10 +25,9 @@ class ImportResult:
 
 
 class MediaImporter:
-    def __init__(self, project: Project, decoder: MediaDecoder, waveform_dir: Path) -> None:
+    def __init__(self, project: Project, decoder: MediaDecoder) -> None:
         self.project = project
         self.decoder = decoder
-        self.waveform_dir = waveform_dir
         self._id_counter = itertools.count(1)
 
     def import_paths(self, paths: Iterable[Path]) -> ImportResult:
@@ -74,10 +73,15 @@ class MediaImporter:
 
     def _generate_waveform(self, asset: Asset) -> None:
         try:
-            audio = self.decoder.audio_segment(asset.id, Path(asset.path), 0.0, 5.0)
+            audio = self.decoder.audio_segment(asset.id, Path(asset.path), 0.0, None)
             waveform = compute_waveform(audio.samples)
-            target = self.waveform_dir / f"{asset.id}.waveform"
-            target.parent.mkdir(parents=True, exist_ok=True)
+            asset_path = Path(asset.path)
+            if asset_path.suffix:
+                target = asset_path.with_suffix(asset_path.suffix + ".waveform")
+            else:
+                target = asset_path.with_name(asset_path.name + ".waveform")
+            if not target.parent.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
             save_waveform(target, waveform)
         except Exception:
             pass

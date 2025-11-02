@@ -23,9 +23,10 @@ def apply_mosaic(frame_bgr: np.ndarray, roi: Tuple[int, int, int, int], blocks: 
         return frame_copy
 
     blocks = max(1, blocks)
-    downscale_w = max(1, w // blocks)
-    downscale_h = max(1, h // blocks)
-    small = cv2.resize(region, (downscale_w, downscale_h), interpolation=cv2.INTER_LINEAR)
+    downscale_w = min(blocks, w)
+    scale = downscale_w / max(w, 1)
+    downscale_h = max(1, int(round(h * scale)))
+    small = cv2.resize(region, (downscale_w, downscale_h), interpolation=cv2.INTER_AREA)
     pixelated = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
     frame_copy[y : y + h, x : x + w] = pixelated
     return frame_copy

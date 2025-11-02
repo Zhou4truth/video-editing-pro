@@ -16,6 +16,12 @@ from typing import Dict, Optional, Tuple
 import av
 import numpy as np
 
+TICKS_PER_SECOND = 90_000
+
+
+def _seconds_to_ticks(seconds: float) -> int:
+    return int(round(seconds * TICKS_PER_SECOND))
+
 
 @dataclass
 class VideoFrame:
@@ -42,8 +48,8 @@ class FrameCache:
         self._hits = 0
         self._clock = 0
 
-    def get(self, asset_id: str, key: int) -> Optional[VideoFrame]:
-        handle = (asset_id, key)
+    def get(self, asset_id: str, key_ticks: int) -> Optional[VideoFrame]:
+        handle = (asset_id, key_ticks)
         frame = self._entries.get(handle)
         if frame is None:
             return None
@@ -51,8 +57,8 @@ class FrameCache:
         self._order[handle] = self._clock
         return frame
 
-    def put(self, asset_id: str, key: int, frame: VideoFrame) -> None:
-        handle = (asset_id, key)
+    def put(self, asset_id: str, key_ticks: int, frame: VideoFrame) -> None:
+        handle = (asset_id, key_ticks)
         self._entries[handle] = frame
         self._clock += 1
         self._order[handle] = self._clock
@@ -102,16 +108,15 @@ class MediaDecoder:
     def video_frame_at(self, asset_id: str, path: Path, seconds: float) -> VideoFrame:
         with self._lock:
             container, stream = self._ensure_video_container(asset_id, path)
-            fps = float(stream.average_rate or 30)
-            key = int(seconds * fps)
-            cached = self._frame_cache.get(asset_id, key)
+            target_ticks = _seconds_to_ticks(seconds)
+            cached = self._frame_cache.get(asset_id, target_ticks)
             if cached:
                 return cached
 
-            seek_pts = int(seconds * stream.time_base.denominator / stream.time_base.numerator)
+            seek_pts = int(seconds / stream.time_base)
             container.seek(seek_pts, stream=stream, any_frame=False, backward=True)
 
-            frame = None
+            last_frame: Optional[VideoFrame] = None
             for packet in container.demux(stream):
                 for decoded in packet.decode():
                     pts_seconds = float(decoded.pts * decoded.time_base) if decoded.pts is not None else 0.0
@@ -119,18 +124,25 @@ class MediaDecoder:
                         pts=pts_seconds,
                         image=decoded.to_ndarray(format="bgr24"),
                     )
-                    if pts_seconds >= seconds:
-                        break
-                if frame and frame.pts >= seconds:
+                    frame_ticks = _seconds_to_ticks(frame.pts)
+                    self._frame_cache.put(asset_id, frame_ticks, frame)
+                    last_frame = frame
+                    if frame_ticks >= target_ticks:
+                        return frame
+                if last_frame and _seconds_to_ticks(last_frame.pts) >= target_ticks:
                     break
 
-            if frame is None:
+            if last_frame is None:
                 raise DecoderError(f"No frame decoded at {seconds}s for {path}")
+            return last_frame
 
-            self._frame_cache.put(asset_id, key, frame)
-            return frame
-
-    def audio_segment(self, asset_id: str, path: Path, start: float, duration: float) -> AudioBuffer:
+    def audio_segment(
+        self,
+        asset_id: str,
+        path: Path,
+        start: float,
+        duration: Optional[float],
+    ) -> AudioBuffer:
         with self._lock:
             container, stream = self._ensure_audio_container(asset_id, path)
             start_pts = int(start / stream.time_base)
@@ -138,7 +150,7 @@ class MediaDecoder:
 
             samples = []
             sample_rate = stream.codec_context.rate
-            target_samples = int(duration * sample_rate)
+            target_samples = int(duration * sample_rate) if duration and duration > 0 else None
             current_time = 0.0
             for packet in container.demux(stream):
                 for frame in packet.decode():
@@ -146,16 +158,16 @@ class MediaDecoder:
                     current_time = frame_time
                     array = frame.to_ndarray(format="float32")
                     samples.append(array)
-                    if sum(buf.shape[0] for buf in samples) >= target_samples:
+                    if target_samples is not None and sum(buf.shape[0] for buf in samples) >= target_samples:
                         break
-                if sum(buf.shape[0] for buf in samples) >= target_samples:
+                if target_samples is not None and sum(buf.shape[0] for buf in samples) >= target_samples:
                     break
 
             if not samples:
                 raise DecoderError(f"No audio decoded from {path}")
 
             audio = np.concatenate(samples, axis=0)
-            if target_samples and audio.shape[0] > target_samples:
+            if target_samples is not None and audio.shape[0] > target_samples:
                 audio = audio[:target_samples]
 
             return AudioBuffer(start=start, samples=audio, rate=sample_rate)

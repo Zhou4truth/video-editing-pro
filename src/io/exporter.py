@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -56,34 +56,91 @@ class Exporter:
         fps = self.project.settings.fps
         duration = self.project.total_length_seconds()
         total_frames = max(int(np.ceil(duration * fps)), 1)
+        width = preset_opts["width"]
+        height = preset_opts["height"]
 
         compositor = Compositor(self.project, self.decoder)
+        audio_bus = self._render_audio_bus()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_dir_path = Path(temp_dir)
-            frame_dir = temp_dir_path / "frames"
-            frame_dir.mkdir(parents=True, exist_ok=True)
             audio_path = temp_dir_path / "mix.wav"
+            sf.write(str(audio_path), audio_bus, samplerate=48_000, subtype="PCM_16")
 
-            for index in range(total_frames):
-                if cancel_flag and cancel_flag():
-                    raise RuntimeError("Export cancelled")
-                seconds = index / fps
-                frame = compositor.render_frame(seconds)
-                resized = cv2.resize(frame, (preset_opts["width"], preset_opts["height"]))
-                frame_file = frame_dir / f"frame_{index:05d}.png"
-                cv2.imwrite(str(frame_file), resized)
-                if progress_callback:
-                    progress_callback(index / total_frames)
+            command = self._build_ffmpeg_command(
+                audio_path=audio_path,
+                output_path=output_path,
+                fps=fps,
+                width=width,
+                height=height,
+                options=preset_opts,
+            )
 
-            bus = self._render_audio_bus()
-            sf.write(str(audio_path), bus, samplerate=48_000)
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if process.stdin is None or process.stderr is None:
+                raise RuntimeError("Failed to launch ffmpeg with proper pipes")
 
-            frame_pattern = frame_dir / "frame_%05d.png"
-            command = self._build_ffmpeg_command(frame_pattern, audio_path, output_path, fps, preset_opts)
-            process = subprocess.run(command, capture_output=True, text=True)
-            if process.returncode != 0:
-                raise RuntimeError(f"ffmpeg failed: {process.stderr}")
+            state = {"render": 0.0, "encode": 0.0}
+            logs: List[str] = []
+            lock = threading.Lock()
+
+            def _publish() -> None:
+                if not progress_callback:
+                    return
+                with lock:
+                    progress_callback(max(state["render"], state["encode"]))
+
+            def _read_stderr() -> None:
+                while True:
+                    raw_line = process.stderr.readline()
+                    if not raw_line:
+                        break
+                    line = raw_line.decode("utf-8", errors="ignore").strip()
+                    logs.append(line)
+                    progress = self._parse_encoder_progress(line, fps, total_frames)
+                    if progress is not None:
+                        with lock:
+                            state["encode"] = max(state["encode"], progress)
+                        _publish()
+
+            reader = threading.Thread(target=_read_stderr, daemon=True)
+            reader.start()
+
+            try:
+                for index in range(total_frames):
+                    if cancel_flag and cancel_flag():
+                        raise RuntimeError("Export cancelled")
+                    seconds = index / fps
+                    frame = compositor.render_frame(seconds)
+                    resized = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
+                    process.stdin.write(resized.tobytes())
+                    with lock:
+                        state["render"] = max(state["render"], (index + 1) / total_frames)
+                    _publish()
+            except Exception:
+                try:
+                    process.stdin.close()
+                except Exception:
+                    pass
+                process.terminate()
+                reader.join()
+                process.wait()
+                raise
+            else:
+                process.stdin.close()
+                return_code = process.wait()
+                reader.join()
+                if return_code != 0:
+                    tail = "\n".join(logs[-10:])
+                    raise RuntimeError(f"ffmpeg failed (code {return_code}): {tail}")
+                with lock:
+                    state["encode"] = 1.0
+                    state["render"] = 1.0
+                _publish()
 
         if progress_callback:
             progress_callback(1.0)
@@ -91,19 +148,26 @@ class Exporter:
 
     def _build_ffmpeg_command(
         self,
-        frame_pattern: Path,
         audio_path: Path,
         output_path: Path,
         fps: int,
+        width: int,
+        height: int,
         options: Dict,
     ):
         return [
             str(self.ffmpeg_path),
             "-y",
-            "-framerate",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
             str(fps),
             "-i",
-            str(frame_pattern),
+            "-",
             "-i",
             str(audio_path),
             "-c:v",
@@ -116,10 +180,32 @@ class Exporter:
             "yuv420p",
             "-c:a",
             "aac",
+            "-ar",
+            "48000",
             "-b:a",
             options["audio_bitrate"],
             str(output_path),
         ]
+
+    @staticmethod
+    def _parse_encoder_progress(line: str, fps: int, total_frames: int) -> Optional[float]:
+        if "frame=" in line:
+            try:
+                frame_str = line.split("frame=")[1].split()[0]
+                frame_index = int(frame_str)
+                return min(frame_index / max(total_frames, 1), 1.0)
+            except (ValueError, IndexError):
+                pass
+        if "time=" in line:
+            try:
+                time_str = line.split("time=")[1].split()[0]
+                h, m, s = time_str.split(":")
+                seconds = (int(h) * 3600) + (int(m) * 60) + float(s)
+                frame_index = seconds * fps
+                return min(frame_index / max(total_frames, 1), 1.0)
+            except (ValueError, IndexError):
+                pass
+        return None
 
     def _render_audio_bus(self) -> np.ndarray:
         sample_rate = 48_000

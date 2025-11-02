@@ -8,8 +8,10 @@ import numpy as np
 
 @dataclass
 class DuckingParams:
-    threshold: float = -30.0  # dBFS
-    reduction: float = -12.0  # dB change when voice is loud
+    threshold: float = -30.0  # dBFS threshold for voice detection
+    base_gain_db: float = 0.0  # dB applied when voice below threshold
+    slope: float = 1.0  # dB attenuation per dB above threshold
+    min_gain_db: float = -12.0  # Clamp lower bound
     attack: float = 0.05  # seconds
     release: float = 0.3  # seconds
 
@@ -27,25 +29,33 @@ def apply_ducking(voice: np.ndarray, music: np.ndarray, sample_rate: int, params
         raise ValueError("Voice and music buffers must match")
 
     frame_size = max(int(sample_rate * 0.01), 1)  # 10ms windows
-    attack_coeff = np.exp(-1.0 / (params.attack * sample_rate)) if params.attack > 0 else 0.0
-    release_coeff = np.exp(-1.0 / (params.release * sample_rate)) if params.release > 0 else 0.0
-    gain = 1.0
+    frame_duration = frame_size / sample_rate
+
+    def _time_coeff(time_constant: float) -> float:
+        if time_constant <= 0:
+            return 0.0
+        return float(np.exp(-frame_duration / time_constant))
+
+    attack_coeff = _time_coeff(params.attack)
+    release_coeff = _time_coeff(params.release)
+    gain_db = params.base_gain_db
     output = np.zeros_like(music)
 
-    for i in range(0, len(music), frame_size):
-        window_voice = voice[i : i + frame_size]
-        window_music = music[i : i + frame_size]
+    for start in range(0, len(music), frame_size):
+        end = start + frame_size
+        window_voice = voice[start:end]
+        window_music = music[start:end]
         level = rms_db(window_voice) if window_voice.size else -120.0
-        target_gain_db = 0.0
-        if level > params.threshold:
-            target_gain_db = params.reduction * ((level - params.threshold) / abs(params.reduction))
-            target_gain_db = max(params.reduction, target_gain_db)
+        level_over = max(0.0, level - params.threshold)
+        target_gain_db = params.base_gain_db - params.slope * level_over
+        target_gain_db = max(params.min_gain_db, target_gain_db)
 
-        target_gain = 10 ** (target_gain_db / 20)
-        if target_gain < gain:
-            gain = attack_coeff * (gain - target_gain) + target_gain
+        if target_gain_db < gain_db:
+            gain_db = attack_coeff * (gain_db - target_gain_db) + target_gain_db
         else:
-            gain = release_coeff * (gain - target_gain) + target_gain
-        output[i : i + frame_size] = window_music * gain
+            gain_db = release_coeff * (gain_db - target_gain_db) + target_gain_db
+
+        gain_linear = 10 ** (gain_db / 20)
+        output[start:end] = window_music * gain_linear
 
     return output
