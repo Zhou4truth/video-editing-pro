@@ -1,0 +1,6 @@
+PySide6==6.*
+numpy
+opencv-python
+av
+soundfile
+pydub

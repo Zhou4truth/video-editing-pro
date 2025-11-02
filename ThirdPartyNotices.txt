@@ -1,0 +1,15 @@
+Third-Party Notices
+===================
+
+This project bundles or depends on the following third-party components:
+
+- Python (https://www.python.org/)
+- PySide6 (https://doc.qt.io/qtforpython/)
+- NumPy (https://numpy.org/)
+- OpenCV (https://opencv.org/)
+- PyAV (https://github.com/PyAV-Org/PyAV)
+- soundfile (https://pysoundfile.readthedocs.io/)
+- pydub (https://github.com/jiaaro/pydub)
+- FFmpeg (https://ffmpeg.org/) – binaries redistributed separately under LGPL/GPL licenses.
+
+Detailed license texts will be consolidated alongside the release deliverables.

@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-editor-mvp"
+version = "0.1.0"
+description = "Python + Qt video editor MVP with Windows-focused packaging."
+readme = "README.md"
+authors = [{ name = "Video Editor MVP Team" }]
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
